@@ -1,0 +1,14 @@
+.venv
+.git
+.grok
+data
+research
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.DS_Store
+tests
+README.md
+*.md
+static/shots

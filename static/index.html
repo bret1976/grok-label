@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Grok Label · Operations Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"/>
+  <link rel="stylesheet" href="/static/app.css"/>
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn" id="rail-toggle" type="button" aria-label="Toggle site panel">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="brand">
+      <i class="orb"></i>
+      <strong>Grok Label</strong>
+    </div>
+    <div class="ops">
+      <span>Operations Center</span>
+      <em>1 camera</em>
+    </div>
+    <label class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M20 20l-3.2-3.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <input id="prompt" placeholder="Search tracks, classes, frames" autocomplete="off"/>
+    </label>
+    <div class="chips">
+      <button class="chip" id="chip-level" type="button"><b></b><span>Idle<small>Task priority</small></span></button>
+      <button class="chip" id="chip-status" type="button"><b class="warn"></b><span>Standby<small>Camera status</small></span></button>
+      <button class="chip on" id="chip-refresh" type="button"><b class="ok"></b><span>Every 1.5s<small>Auto-refresh</small></span></button>
+    </div>
+    <button class="icon-btn bell" type="button" aria-label="Alerts">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 9a6 6 0 1 1 12 0c0 7 3 7 3 9H3c0-2 3-2 3-9Z" stroke="currentColor" stroke-width="1.6"/><path d="M10 20a2 2 0 0 0 4 0" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+    <div class="avatars">
+      <img src="/static/img/ava1.jpg" alt=""/>
+      <img src="/static/img/ava2.jpg" alt=""/>
+      <img src="/static/img/ava3.jpg" alt=""/>
+      <span>+3</span>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="rail" id="rail">
+      <div class="site-card">
+        <div class="site-head">
+          <div>
+            <h2 id="cam-title">CAM-01</h2>
+            <p>Floor camera · Grok vision</p>
+          </div>
+          <div class="loss">
+            <small>Coverage</small>
+            <strong id="stat-coverage">0%</strong>
+          </div>
+        </div>
+        <p class="incident" id="incident-copy">Upload CCTV. Grok labels people, cardboard boxes, plastic totes, and carts, then holds track IDs across frames.</p>
+        <div class="actions" id="log">
+          <div class="action">
+            <span>Waiting for footage</span>
+            <em>Standby</em>
+          </div>
+        </div>
+      </div>
+
+      <div class="indicators">
+        <div><small>Tracks</small><b id="ind-tracks">0</b></div>
+        <div><small>People</small><b id="ind-people">0</b></div>
+        <div><small>Parcels</small><b id="ind-parcels">0</b></div>
+        <div><small>Carts</small><b id="ind-carts">0</b></div>
+      </div>
+
+      <div class="view-switch">
+        <button class="on" data-view="inspect" type="button">Inspect</button>
+        <button data-view="map" type="button">Map</button>
+        <button data-view="health" type="button">Health</button>
+      </div>
+    </aside>
+
+    <section class="stage" id="stage" data-view="inspect">
+      <div class="scene" id="drop">
+        <img class="scene-bg" src="/static/img/scene.jpg" alt=""/>
+        <img class="map-bg" src="/static/img/map.jpg" alt=""/>
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <canvas id="map-canvas"></canvas>
+        <svg class="beams" id="beams" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
+        <div class="ring"></div>
+        <div class="cam-badge" id="view-label">CAM 01 · ANNOTATION OVERLAY</div>
+        <div class="wm">GROK<br/>VISION</div>
+        <div class="floats" id="floats"></div>
+        <div class="pins" id="map-pins"></div>
+        <div class="feed-tag">Live feed</div>
+        <button class="dropzone" id="dropzone" type="button">
+          <div class="drop-card">
+            <strong>Drop CCTV footage</strong>
+            <span>MP4 or MOV. Grok labels people, boxes, totes, and carts on your clip.</span>
+          </div>
+        </button>
+        <div class="legend" id="legend" hidden></div>
+        <div class="clock" id="clock">00:00.00 / 00:00.00</div>
+        <div class="side-tools">
+          <button type="button" id="btn-original">Orig</button>
+          <button type="button" id="btn-annotated" class="on">Anno</button>
+        </div>
+        <div class="transport">
+          <button id="play" type="button">▶</button>
+          <input id="scrub" type="range" min="0" max="1000" value="0"/>
+          <label class="sw"><input id="overlay-on" type="checkbox" checked/><i></i> Overlay</label>
+          <label class="sw"><input id="labels-on" type="checkbox" checked/><i></i> Labels</label>
+          <label class="sw"><input id="trails-on" type="checkbox" checked/><i></i> Trails</label>
+          <label class="sw"><input id="interp-on" type="checkbox" checked/><i></i> Interp</label>
+          <label class="file">Upload<input id="file" type="file" accept="video/mp4,video/quicktime,video/*" hidden/></label>
+        </div>
+      </div>
+
+      <div class="health" id="health">
+        <div class="health-copy">
+          <p class="kicker">CAM-01</p>
+          <h3>Floor camera</h3>
+          <p class="incident" id="health-copy">Grok vision on your footage. Component health is class coverage in the current job.</p>
+          <div class="health-actions">
+            <button class="ghost" id="composer-upload" type="button">Upload clip</button>
+            <button class="solid" id="composer-go" type="button">Start labeling</button>
+          </div>
+        </div>
+        <div class="health-stage">
+          <img class="health-cam" src="/static/img/camera.jpg" alt=""/>
+          <div class="floats" id="health-floats"></div>
+        </div>
+        <div class="components" id="components">
+          <div class="comp bad"><small>People</small><strong>0%</strong><div class="bar"><i style="width:4%"></i></div></div>
+          <div class="comp bad"><small>Cardboard boxes</small><strong>0%</strong><div class="bar"><i style="width:4%"></i></div></div>
+          <div class="comp bad"><small>Plastic totes</small><strong>0%</strong><div class="bar"><i style="width:4%"></i></div></div>
+          <div class="comp bad"><small>Carts</small><strong>0%</strong><div class="bar"><i style="width:4%"></i></div></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="kpis">
+    <div class="mini">
+      <img src="/static/img/minimap.jpg" alt=""/>
+      <div>
+        <small>Scene review</small>
+        <b id="stat-all">0</b>
+        <span>tracks in view</span>
+      </div>
+    </div>
+
+    <div class="kpi-group">
+      <p>Active labels</p>
+      <div class="kpi-row">
+        <button class="kpi asset on" data-filter="all" type="button">
+          <small>Active tracks</small><strong id="kpi-tracks">0</strong>
+          <span class="delta" id="delta-tracks">vs last sample</span>
+          <em id="spark-tracks" class="spark"></em>
+        </button>
+        <button class="kpi asset" data-filter="person" type="button">
+          <small>People</small><strong id="stat-employees">0</strong>
+          <span class="delta red" id="delta-people">critical class</span>
+          <em id="spark-people" class="spark red"></em>
+        </button>
+        <button class="kpi asset" data-filter="parcel" type="button">
+          <small>Parcels</small><strong id="stat-parcels">0</strong>
+          <span class="delta" id="delta-parcels">flow</span>
+          <em class="spark"></em>
+        </button>
+        <button class="kpi asset" data-filter="cart" type="button">
+          <small>Carts</small><strong id="stat-carts">0</strong>
+          <span class="delta" id="delta-carts">transport</span>
+          <em class="spark"></em>
+        </button>
+        <div class="kpi">
+          <small>Unlabeled</small><strong id="kpi-loss">0%</strong>
+          <span class="delta red">gap</span>
+          <em class="spark red"></em>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-group">
+      <p>Incidents profile</p>
+      <div class="kpi-row">
+        <div class="kpi blush">
+          <small>Coverage</small><strong id="kpi-sla">0%</strong>
+          <span class="delta red">SLA analog</span>
+          <em class="spark red"></em>
+        </div>
+        <div class="kpi blush">
+          <small>Avg confidence</small><strong id="kpi-conf">—</strong>
+          <span class="delta">model</span>
+          <em class="spark"></em>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-group">
+      <p>Impact</p>
+      <div class="kpi-row">
+        <div class="kpi">
+          <small>Frames labeled</small><strong id="kpi-frames">0</strong>
+          <em class="spark"></em>
+        </div>
+        <div class="kpi">
+          <small>Model</small><strong id="model-name" class="model">grok</strong>
+          <em class="spark"></em>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-group">
+      <p>Response</p>
+      <div class="kpi-row">
+        <div class="kpi blush">
+          <small>Job status</small><strong id="hint">Idle</strong>
+          <em class="spark red"></em>
+        </div>
+        <div class="kpi">
+          <small>Elapsed</small><strong id="kpi-time">0s</strong>
+          <em class="spark"></em>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div class="onboard" id="onboard" hidden>
+    <div class="onboard-card">
+      <p class="kicker">Your cameras. Your footage.</p>
+      <h2>Label your own floor.</h2>
+      <p>Upload CCTV. Grok detects people, boxes, totes, and carts, then you inspect tracks on a live ops canvas.</p>
+      <ol>
+        <li><b>1</b><div><strong>Upload a clip</strong><span>MP4 or MOV from your floor, yard, or line.</span></div></li>
+        <li><b>2</b><div><strong>Grok annotates</strong><span>Classes and stable IDs across sampled frames.</span></div></li>
+        <li><b>3</b><div><strong>Inspect</strong><span>3D scene, map, and component health. Toggle overlay, labels, trails.</span></div></li>
+      </ol>
+      <button class="solid" id="onboard-go" type="button">Upload footage and start</button>
+      <button class="skip" id="onboard-skip" type="button">Skip and look around</button>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
