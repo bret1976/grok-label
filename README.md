@@ -34,7 +34,7 @@ Grok does the labeling. No Higgsfield.
 1. Upload CCTV (or use the downloaded sample clip).
 2. Sample frames (`SAMPLE_FPS`, default 4).
 3. **Grok vision** (`XAI_API_KEY`, default `grok-4.5`) returns boxes per full frame **and** a tile grid so small parcels are not skipped.
-4. IoU tracker assigns stable IDs; the player interpolates between sampled frames.
+4. **BYTE tracker** (ByteTrack-style, see below) assigns stable IDs; the player interpolates between sampled frames.
 5. Inspect UI matches the demo: class cards, overlay, labels, trails, interpolation.
 
 ```bash
@@ -58,3 +58,25 @@ Env:
 | `MAX_CONCURRENCY` | parallel Grok calls |
 
 Screenshots from the original post live in `research/`.
+
+## Tracking (BYTE, ByteTrack-style)
+
+`app/tracker.py` is an original pure-Python take on the BYTE association from
+[FoundationVision/ByteTrack](https://github.com/FoundationVision/ByteTrack) (MIT):
+
+- high-confidence boxes match first against active **and recently lost** tracks, using a
+  constant-velocity predicted box (plus a centre-distance fallback for fast movers at 4 fps);
+- low-confidence boxes (usually occluded / overlapping parcels) can only *continue* a track, never start one;
+- lost tracks survive `track_buffer` sampled frames (default 8 ≈ 2 s), so one missed frame no longer spawns a new ID;
+- short gaps are filled with interpolated boxes (`source: "interpolated"`).
+
+On a synthetic 160-object / 81-frame warehouse clip with 15% of boxes missed per frame,
+the old greedy IoU tracker produced 1,336 IDs; the BYTE tracker produces 179.
+
+API:
+
+| Route | Use |
+| --- | --- |
+| `GET /api/tracker` | algorithm + default params |
+| `POST /api/track` | track your own detections `{frames:[{t, detections:[{class,x,y,w,h,score}]}], params:{}}` — no Grok call |
+| `POST /api/jobs/{id}/retrack` | re-run tracking on a finished job with new params — no Grok call |

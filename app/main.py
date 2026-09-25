@@ -5,13 +5,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from typing import Any
+
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.grok_vision import resolve_api_key
-from app.pipeline import JOBS, load_job, new_job, run_job
-from app.tracker import interpolate_box
+from app.pipeline import JOBS, load_job, new_job, run_job, save_job
+from app.tracker import DEFAULTS as TRACKER_DEFAULTS
+from app.tracker import assign_tracks, interpolate_box, stats
 
 load_dotenv()
 
@@ -50,6 +53,7 @@ async def health():
         "model": os.environ.get("GROK_MODEL", "grok-4.20-0309-non-reasoning"),
         "has_key": True if _has_key() else False,
         "upload": True,
+        "tracker": "byte-v1",
     }
 
 
@@ -89,6 +93,7 @@ def public_job(job: dict) -> dict:
         "log": job.get("log") or [],
         "model": job.get("model"),
         "has_frames": bool(job.get("frames")),
+        "tracker": job.get("tracker") or {},
     }
 
 
@@ -136,7 +141,7 @@ async def overlay(job_id: str, t: float = 0.0):
     alpha = (t - a["t"]) / span
     by_id_a = {d["track_id"]: d for d in a.get("detections") or [] if d.get("track_id")}
     by_id_b = {d["track_id"]: d for d in b.get("detections") or [] if d.get("track_id")}
-    mixed = []
+    mixed = [{**d, "source": "detected"} for d in a.get("detections") or [] if not d.get("track_id")]
     for tid, da in by_id_a.items():
         db = by_id_b.get(tid)
         mixed.append(interpolate_box(da, db, alpha) if db else {**da, "source": "detected"})
@@ -163,6 +168,96 @@ async def job_frame(job_id: str, name: str):
     if not path.exists():
         raise HTTPException(404, "frame missing")
     return FileResponse(path, media_type="image/jpeg")
+
+
+MAX_TRACK_FRAMES = 2000
+MAX_TRACK_DETS = 600
+
+
+def _clean_params(raw: Any) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, default in TRACKER_DEFAULTS.items():
+        if key in raw:
+            try:
+                val = float(raw[key])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"param {key} must be a number")
+            if key in ("track_buffer", "max_gap_fill"):
+                val = max(0, min(int(val), 60))
+            else:
+                val = max(0.0, min(val, 1.0))
+            out[key] = val
+    return out
+
+
+def _clean_frames(raw: Any) -> list[dict]:
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "frames must be a non-empty list")
+    if len(raw) > MAX_TRACK_FRAMES:
+        raise HTTPException(413, f"max {MAX_TRACK_FRAMES} frames")
+    frames = []
+    for i, f in enumerate(raw):
+        dets_in = (f or {}).get("detections") or []
+        if len(dets_in) > MAX_TRACK_DETS:
+            raise HTTPException(413, f"max {MAX_TRACK_DETS} detections per frame")
+        dets = []
+        for d in dets_in:
+            try:
+                dets.append({
+                    "class": str(d["class"]).strip().lower(),
+                    "x": float(d["x"]), "y": float(d["y"]),
+                    "w": max(1e-4, float(d["w"])), "h": max(1e-4, float(d["h"])),
+                    "score": float(d.get("score", 0.6)),
+                })
+            except (KeyError, TypeError, ValueError):
+                raise HTTPException(400, f"frame {i}: each detection needs class, x, y, w, h")
+        frames.append({"index": i, "t": float((f or {}).get("t", i)), "detections": dets})
+    return frames
+
+
+@app.get("/api/tracker")
+async def tracker_info():
+    return {
+        "algorithm": "BYTE two-stage association (ByteTrack-style) + motion prediction + gap fill",
+        "inspired_by": "https://github.com/FoundationVision/ByteTrack (MIT)",
+        "defaults": TRACKER_DEFAULTS,
+        "endpoints": {
+            "POST /api/track": "track your own detections: {frames:[{t, detections:[{class,x,y,w,h,score}]}], params:{}}",
+            "POST /api/jobs/{id}/retrack": "re-run tracking on a finished job with new params (no new Grok calls)",
+        },
+    }
+
+
+@app.post("/api/track")
+async def track_detections(payload: dict = Body(...)):
+    frames = _clean_frames(payload.get("frames"))
+    result = assign_tracks(frames, **_clean_params(payload.get("params")))
+    return {
+        "frames": frames,
+        "tracks": result["tracks"],
+        "stats": stats(frames, result["tracks"]),
+        "tracker": result["tracker"],
+    }
+
+
+@app.post("/api/jobs/{job_id}/retrack")
+async def retrack(job_id: str, payload: dict = Body(default={})):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("status") != "done" or not job.get("frames"):
+        raise HTTPException(409, "job is not finished yet")
+    frames = job["frames"]
+    result = assign_tracks(frames, **_clean_params((payload or {}).get("params")))
+    job["frames"] = frames
+    job["tracks"] = result["tracks"]
+    job["class_counts"] = result["class_counts"]
+    job["stats"] = stats(frames, result["tracks"])
+    job["tracker"] = result["tracker"]
+    save_job(job)
+    return public_job(job)
 
 
 if __name__ == "__main__":

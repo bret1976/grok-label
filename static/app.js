@@ -160,9 +160,9 @@ function detsAt(t) {
   const useInterp = document.getElementById("interp-on").checked;
   if (!useInterp || a === b) return a.detections || [];
   const alpha = (t - a.t) / ((b.t - a.t) || 1);
-  const mapB = Object.fromEntries((b.detections || []).map((d) => [d.track_id, d]));
+  const mapB = Object.fromEntries((b.detections || []).filter((d) => d.track_id).map((d) => [d.track_id, d]));
   return (a.detections || []).map((da) => {
-    const db = mapB[da.track_id];
+    const db = da.track_id ? mapB[da.track_id] : null;
     return db ? lerp(da, db, alpha) : da;
   });
 }

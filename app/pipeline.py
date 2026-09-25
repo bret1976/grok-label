@@ -99,6 +99,15 @@ async def run_job(job_id: str) -> None:
     job["tracks"] = tracks["tracks"]
     job["class_counts"] = tracks["class_counts"]
     job["stats"] = stats(job["frames"], job["tracks"])
+    job["tracker"] = tracks.get("tracker") or {}
+    tk = job["tracker"]
+    log(
+        job,
+        f"BYTE tracker: {tk.get('refound_after_miss', 0)} tracks re-found after a missed frame, "
+        f"{tk.get('rescued_low_score', 0)} low-confidence boxes kept on their track, "
+        f"{tk.get('gap_filled_boxes', 0)} occlusion gaps filled.",
+        "tool",
+    )
     job["status"] = "done"
     job["progress"] = 1
     log(
