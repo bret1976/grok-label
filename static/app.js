@@ -318,6 +318,19 @@ function fmt(s) {
   return `${String(m).padStart(2, "0")}:${sec.toFixed(2).padStart(5, "0")}`;
 }
 
+function setExportChip(ready) {
+  const el = document.getElementById("chip-export");
+  if (!el) return;
+  if (ready && jobId) {
+    el.hidden = false;
+    el.href = `/api/jobs/${jobId}/export?format=zip`;
+    el.setAttribute("download", `grok-label-${jobId}-dataset.zip`);
+  } else {
+    el.hidden = true;
+    el.removeAttribute("href");
+  }
+}
+
 function setStatus(job) {
   const chip = document.getElementById("chip-status");
   const level = document.getElementById("chip-level");
@@ -325,12 +338,17 @@ function setStatus(job) {
   if (status === "done") {
     chip.innerHTML = `<b class="ok"></b><span>Ready<small>Camera status</small></span>`;
     level.innerHTML = `<b class="ok"></b><span>Live<small>Task priority</small></span>`;
+    setExportChip(true);
   } else if (status === "error") {
     chip.innerHTML = `<b class="bad"></b><span>Degraded<small>Camera status</small></span>`;
     level.innerHTML = `<b class="bad"></b><span>Critical<small>Task priority</small></span>`;
+    setExportChip(false);
   } else if (job) {
     chip.innerHTML = `<b class="warn"></b><span>Labeling<small>Camera status</small></span>`;
     level.innerHTML = `<b class="warn"></b><span>Medium<small>Task priority</small></span>`;
+    setExportChip(false);
+  } else {
+    setExportChip(false);
   }
 }
 
@@ -365,6 +383,7 @@ async function start(file) {
   annotations = { frames: [], duration: 0, stats: {} };
   trails.length = 0;
   floatKey = pinKey = healthKey = beamKey = "";
+  setExportChip(false);
   document.getElementById("drop").classList.add("has-clip");
   document.getElementById("legend").hidden = false;
   document.getElementById("cam-title").textContent = (file.name || "CAM-01").replace(/\.[^.]+$/, "").slice(0, 18);

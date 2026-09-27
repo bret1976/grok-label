@@ -80,3 +80,31 @@ API:
 | `GET /api/tracker` | algorithm + default params |
 | `POST /api/track` | track your own detections `{frames:[{t, detections:[{class,x,y,w,h,score}]}], params:{}}` — no Grok call |
 | `POST /api/jobs/{id}/retrack` | re-run tracking on a finished job with new params — no Grok call |
+
+## Dataset pack (COCO / YOLO / MOT)
+
+Inspect used to be a dead end. When a job finishes you can download a **dataset pack** —
+COCO instances JSON, YOLO txt labels, and MOT Challenge `gt.txt` — as a zip from the
+**Dataset pack** chip or:
+
+| Route | Use |
+| --- | --- |
+| `GET /api/export` | formats, box convention, endpoints |
+| `POST /api/export` | `{frames, format: coco\|yolo\|mot\|zip, width?, height?}` — BYTE-tracks then exports |
+| `GET /api/jobs/{id}/export?format=zip` | finished job → zip (`coco` / `yolo` / `mot` also supported) |
+
+Zip contents: `annotations.coco.json`, `labels/*.txt`, `gt/gt.txt`, `classes.txt`,
+`meta.json`, `README.txt`.
+
+Boxes stay normalized 0–1 xywh (top-left) in the job; COCO/MOT convert to pixels
+(default 960×H from the jpeg, else 960×540). YOLO stays normalized. Untracked
+detections appear in COCO/YOLO but are omitted from MOT. Interpolated gap-fill
+boxes from the BYTE tracker are included as real labels.
+
+BYTE tracker (`byte-v1`) is still in place for association; export is the missing
+step after tracking.
+
+Inspired by [amanharshx/YOLO-Ndjson-Zip](https://github.com/amanharshx/YOLO-Ndjson-Zip)
+(MIT, multi-format zip idea) plus the public COCO instances, YOLO/Ultralytics txt,
+and MOT Challenge specs. Original code — nothing vendored. Do not copy GPL tooling
+(e.g. X-AnyLabeling).

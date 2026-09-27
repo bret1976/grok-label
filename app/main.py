@@ -7,10 +7,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any
 
-from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from app.export import (
+    CATEGORIES as EXPORT_CATEGORIES,
+    build_meta,
+    resolve_frame_size,
+    to_coco,
+    to_mot_pixels,
+    to_yolo,
+    to_zip_bytes,
+)
 from app.grok_vision import resolve_api_key
 from app.pipeline import JOBS, load_job, new_job, run_job, save_job
 from app.tracker import DEFAULTS as TRACKER_DEFAULTS
@@ -54,6 +63,7 @@ async def health():
         "has_key": True if _has_key() else False,
         "upload": True,
         "tracker": "byte-v1",
+        "export": "dataset-pack-v1",
     }
 
 
@@ -215,6 +225,109 @@ def _clean_frames(raw: Any) -> list[dict]:
                 raise HTTPException(400, f"frame {i}: each detection needs class, x, y, w, h")
         frames.append({"index": i, "t": float((f or {}).get("t", i)), "detections": dets})
     return frames
+
+
+
+EXPORT_FORMATS = ("coco", "yolo", "mot", "zip")
+
+
+def _export_payload(
+    frames: list[dict],
+    *,
+    fmt: str,
+    width: int,
+    height: int,
+    job_id: str | None = None,
+):
+    fmt = (fmt or "coco").strip().lower()
+    if fmt not in EXPORT_FORMATS:
+        raise HTTPException(400, f"format must be one of {', '.join(EXPORT_FORMATS)}")
+    if fmt == "coco":
+        return to_coco(frames, width=width, height=height, job_id=job_id)
+    if fmt == "yolo":
+        return {
+            "files": to_yolo(frames),
+            "classes": list(EXPORT_CATEGORIES),
+            "meta": build_meta(frames, width=width, height=height, job_id=job_id, format_name="yolo"),
+        }
+    if fmt == "mot":
+        return {
+            "gt": to_mot_pixels(frames, width=width, height=height),
+            "meta": build_meta(frames, width=width, height=height, job_id=job_id, format_name="mot"),
+        }
+    blob = to_zip_bytes(frames, width=width, height=height, job_id=job_id)
+    name = f"grok-label-{job_id or 'adhoc'}-dataset.zip"
+    return Response(
+        content=blob,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+@app.get("/api/export")
+async def export_info():
+    return {
+        "pack": "dataset-pack-v1",
+        "formats": list(EXPORT_FORMATS),
+        "box_convention": "normalized_0_1_xywh_top_left",
+        "categories": list(EXPORT_CATEGORIES),
+        "default_size": {"width": 960, "height": 540},
+        "notes": (
+            "COCO/YOLO include untracked detections; MOT skips track_id is None. "
+            "Interpolated gap-fill boxes are included. BYTE tracker remains byte-v1."
+        ),
+        "endpoints": {
+            "POST /api/export": (
+                "{frames:[{t,detections:[{class,x,y,w,h,score,track_id?}]}], "
+                "format:coco|yolo|mot|zip, width?, height?} — tracks ad-hoc frames "
+                "with BYTE when track_ids are missing, then exports"
+            ),
+            "GET /api/jobs/{id}/export?format=coco|yolo|mot|zip": (
+                "download labels for a finished job (zip is the dataset pack)"
+            ),
+        },
+        "inspired_by": [
+            "https://github.com/amanharshx/YOLO-Ndjson-Zip (MIT, multi-format zip idea)",
+            "COCO instances JSON (public spec)",
+            "YOLO / Ultralytics txt (public convention)",
+            "MOT Challenge gt.txt (public format)",
+        ],
+    }
+
+
+@app.post("/api/export")
+async def export_adhoc(payload: dict = Body(...)):
+    frames = _clean_frames(payload.get("frames"))
+    # Preserve any caller-supplied track_id / source that survived cleaning is N/A
+    # (_clean_frames strips them). Run BYTE so MOT/COCO share stable ids.
+    assign_tracks(frames, **_clean_params(payload.get("params")))
+    width = payload.get("width")
+    height = payload.get("height")
+    w, h = resolve_frame_size(None, width=int(width) if width else None, height=int(height) if height else None)
+    fmt = str(payload.get("format") or "coco")
+    return _export_payload(frames, fmt=fmt, width=w, height=h)
+
+
+@app.get("/api/jobs/{job_id}/export")
+async def export_job(
+    job_id: str,
+    format: str = Query("coco", alias="format"),
+    width: int | None = None,
+    height: int | None = None,
+):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("status") != "done" or not job.get("frames"):
+        raise HTTPException(409, "job is not finished yet")
+    frames = job["frames"]
+    frames_dir = JOBS / job_id / "frames"
+    w, h = resolve_frame_size(
+        frames_dir if frames_dir.is_dir() else None,
+        width=width,
+        height=height,
+    )
+    return _export_payload(frames, fmt=format, width=w, height=h, job_id=job_id)
 
 
 @app.get("/api/tracker")
