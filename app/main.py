@@ -22,8 +22,8 @@ from app.export import (
 )
 from app.grok_vision import resolve_api_key
 from app.pipeline import JOBS, load_job, new_job, run_job, save_job
-from app.tracker import DEFAULTS as TRACKER_DEFAULTS
-from app.tracker import assign_tracks, interpolate_box, stats
+from app.tracker import ALGORITHM_IDS, ALGORITHMS, DEFAULTS as TRACKER_DEFAULTS
+from app.tracker import assign_tracks, interpolate_box, normalize_algorithm, stats
 
 load_dotenv()
 
@@ -63,6 +63,8 @@ async def health():
         "has_key": True if _has_key() else False,
         "upload": True,
         "tracker": "byte-v1",
+        "trackers": ["byte-v1", "ocsort-v1"],
+        "tracker_ocsort": True,
         "export": "dataset-pack-v1",
     }
 
@@ -202,6 +204,23 @@ def _clean_params(raw: Any) -> dict[str, float]:
     return out
 
 
+def _resolve_algorithm(payload: dict | None, params: dict | None = None) -> str:
+    """Pick tracker algorithm from top-level tracker= or params.algorithm / params.tracker."""
+    payload = payload or {}
+    params = params or {}
+    raw = (
+        payload.get("tracker")
+        or payload.get("algorithm")
+        or params.get("tracker")
+        or params.get("algorithm")
+        or "byte"
+    )
+    algo = normalize_algorithm(raw)
+    if algo not in ALGORITHMS:
+        raise HTTPException(400, f"tracker must be one of {', '.join(ALGORITHMS)}")
+    return algo
+
+
 def _clean_frames(raw: Any) -> list[dict]:
     if not isinstance(raw, list) or not raw:
         raise HTTPException(400, "frames must be a non-empty list")
@@ -274,13 +293,13 @@ async def export_info():
         "default_size": {"width": 960, "height": 540},
         "notes": (
             "COCO/YOLO include untracked detections; MOT skips track_id is None. "
-            "Interpolated gap-fill boxes are included. BYTE tracker remains byte-v1."
+            "Interpolated gap-fill boxes are included. Default tracker is byte-v1; pass tracker=ocsort for observation-centric recovery (ocsort-v1)."
         ),
         "endpoints": {
             "POST /api/export": (
                 "{frames:[{t,detections:[{class,x,y,w,h,score,track_id?}]}], "
                 "format:coco|yolo|mot|zip, width?, height?} — tracks ad-hoc frames "
-                "with BYTE when track_ids are missing, then exports"
+                "with BYTE/OC-SORT when track_ids are missing, then exports"
             ),
             "GET /api/jobs/{id}/export?format=coco|yolo|mot|zip": (
                 "download labels for a finished job (zip is the dataset pack)"
@@ -299,8 +318,9 @@ async def export_info():
 async def export_adhoc(payload: dict = Body(...)):
     frames = _clean_frames(payload.get("frames"))
     # Preserve any caller-supplied track_id / source that survived cleaning is N/A
-    # (_clean_frames strips them). Run BYTE so MOT/COCO share stable ids.
-    assign_tracks(frames, **_clean_params(payload.get("params")))
+    # (_clean_frames strips them). Run BYTE/OC-SORT so MOT/COCO share stable ids.
+    params = _clean_params(payload.get("params"))
+    assign_tracks(frames, algorithm=_resolve_algorithm(payload, payload.get("params") or {}), **params)
     width = payload.get("width")
     height = payload.get("height")
     w, h = resolve_frame_size(None, width=int(width) if width else None, height=int(height) if height else None)
@@ -333,12 +353,30 @@ async def export_job(
 @app.get("/api/tracker")
 async def tracker_info():
     return {
-        "algorithm": "BYTE two-stage association (ByteTrack-style) + motion prediction + gap fill",
-        "inspired_by": "https://github.com/FoundationVision/ByteTrack (MIT)",
+        "default": "byte-v1",
+        "trackers": list(ALGORITHM_IDS.values()),
+        "algorithms": {
+            "byte": {
+                "id": "byte-v1",
+                "label": "BYTE two-stage association (ByteTrack-style) + motion prediction + gap fill",
+                "inspired_by": "https://github.com/FoundationVision/ByteTrack (MIT)",
+            },
+            "ocsort": {
+                "id": "ocsort-v1",
+                "label": "OC-SORT observation-centric recovery + BYTE two-stage + gap fill",
+                "inspired_by": "https://github.com/noahcao/OC_SORT (MIT, idea only)",
+            },
+        },
         "defaults": TRACKER_DEFAULTS,
         "endpoints": {
-            "POST /api/track": "track your own detections: {frames:[{t, detections:[{class,x,y,w,h,score}]}], params:{}}",
-            "POST /api/jobs/{id}/retrack": "re-run tracking on a finished job with new params (no new Grok calls)",
+            "POST /api/track": (
+                "track your own detections: {frames:[{t, detections:[{class,x,y,w,h,score}]}], "
+                "tracker?:byte|ocsort, params:{}}"
+            ),
+            "POST /api/jobs/{id}/retrack": (
+                "re-run tracking on a finished job with new params / tracker=ocsort "
+                "(no new Grok calls)"
+            ),
         },
     }
 
@@ -346,7 +384,12 @@ async def tracker_info():
 @app.post("/api/track")
 async def track_detections(payload: dict = Body(...)):
     frames = _clean_frames(payload.get("frames"))
-    result = assign_tracks(frames, **_clean_params(payload.get("params")))
+    params = _clean_params(payload.get("params"))
+    result = assign_tracks(
+        frames,
+        algorithm=_resolve_algorithm(payload, payload.get("params") or {}),
+        **params,
+    )
     return {
         "frames": frames,
         "tracks": result["tracks"],
@@ -363,7 +406,13 @@ async def retrack(job_id: str, payload: dict = Body(default={})):
     if job.get("status") != "done" or not job.get("frames"):
         raise HTTPException(409, "job is not finished yet")
     frames = job["frames"]
-    result = assign_tracks(frames, **_clean_params((payload or {}).get("params")))
+    payload = payload or {}
+    params = _clean_params(payload.get("params"))
+    result = assign_tracks(
+        frames,
+        algorithm=_resolve_algorithm(payload, payload.get("params") or {}),
+        **params,
+    )
     job["frames"] = frames
     job["tracks"] = result["tracks"]
     job["class_counts"] = result["class_counts"]

@@ -1,6 +1,6 @@
 """Multi-object tracking for Grok Label.
 
-The association logic follows the BYTE idea from ByteTrack
+The default association follows the BYTE idea from ByteTrack
 (FoundationVision/ByteTrack, MIT license, https://github.com/FoundationVision/ByteTrack):
 
 1. Keep *every* detection box and split them into high-score and low-score sets.
@@ -13,11 +13,23 @@ The association logic follows the BYTE idea from ByteTrack
    ``track_buffer`` sampled frames before they are retired.
 5. Only unmatched high-score boxes start new tracks.
 
-This file is an original pure-Python re-implementation (no numpy / lap / Kalman
-dependencies) tuned for the sparse ~4 fps frames Grok labels. Motion prediction
-is a constant-velocity alpha-beta filter on the box centre and size. After
-tracking, short gaps inside a track are filled with interpolated boxes so the
-Inspect player keeps a steady ID through occlusion.
+Optional algorithm ``ocsort`` (id ``ocsort-v1``) adds Observation-Centric
+recovery inspired by OC-SORT (noahcao/OC_SORT, MIT license,
+https://github.com/noahcao/OC_SORT) — idea only; this file is an original
+pure-Python re-implementation (no numpy / lap / Kalman dependencies), tuned
+for sparse ~4 fps frames:
+
+* OCM-style virtual box: when a track is lost, also score detections against a
+  short linear extrapolation from the last *observations* (not only the
+  alpha-beta predicted box).
+* OCR-style re-link: prefer re-linking a briefly lost track using the last
+  observation box when the Kalman/predicted box has drifted (common when an
+  object stops or turns behind an occluder). On recovery, velocity is
+  re-seeded from last observation → new observation.
+
+Motion prediction remains a constant-velocity alpha-beta filter on the box
+centre and size. After tracking, short gaps inside a track are filled with
+interpolated boxes so the Inspect player keeps a steady ID through occlusion.
 """
 from __future__ import annotations
 
@@ -31,6 +43,12 @@ CLASS_PREFIX = {
     "cart": "CART",
 }
 
+ALGORITHMS = ("byte", "ocsort")
+ALGORITHM_IDS = {
+    "byte": "byte-v1",
+    "ocsort": "ocsort-v1",
+}
+
 DEFAULTS: dict[str, float] = {
     "high_thresh": 0.35,    # score >= this: first association + may start a track
     "low_thresh": 0.1,      # low_thresh <= score < high_thresh: rescue-only boxes
@@ -40,6 +58,18 @@ DEFAULTS: dict[str, float] = {
     "max_gap_fill": 8,      # longest gap (frames) filled with interpolated boxes
     "nms_iou": 0.55,
 }
+
+
+def normalize_algorithm(raw: Any) -> str:
+    """Map API aliases to ``byte`` or ``ocsort`` (default byte)."""
+    if raw is None:
+        return "byte"
+    name = str(raw).strip().lower().replace("_", "").replace("-", "")
+    if name in ("byte", "bytev1", "bytetrack", "bytetracker"):
+        return "byte"
+    if name in ("ocsort", "ocsortv1", "oc"):
+        return "ocsort"
+    return "byte"
 
 
 def iou(a: dict, b: dict) -> float:
@@ -90,6 +120,13 @@ class _Track:
         self.last_frame = frame_idx
         self.hits = 1
         self.lost = False
+        # Observation history for OC-SORT-style recovery (last two boxes + frames).
+        self.last_obs: dict = {
+            "x": det["x"], "y": det["y"], "w": det["w"], "h": det["h"], "class": det["class"]
+        }
+        self.prev_obs: dict | None = None
+        self.prev_obs_frame: int | None = None
+        self.last_obs_frame = frame_idx
 
     def predict(self, frame_idx: int) -> dict:
         dt = max(1, frame_idx - self.last_frame)
@@ -97,13 +134,66 @@ class _Track:
         w, h = max(w, 1e-4), max(h, 1e-4)
         return {"class": self.cls, "x": cx - w / 2, "y": cy - h / 2, "w": w, "h": h}
 
-    def update(self, det: dict, frame_idx: int) -> None:
+    def obs_centric_virtual(self, frame_idx: int) -> dict | None:
+        """Linear extrapolation from the last two *observations* (OCM-style).
+
+        Falls back to the last observation alone when only one obs exists.
+        """
+        if self.prev_obs is None or self.prev_obs_frame is None:
+            return dict(self.last_obs)
+        span = max(1, self.last_obs_frame - self.prev_obs_frame)
+        ahead = frame_idx - self.last_obs_frame
+        # Cap how far we project so a long gap does not invent a far-away box.
+        ahead = min(ahead, span * 2)
+        alpha = ahead / span
+        a, b = self.prev_obs, self.last_obs
+        return {
+            "class": self.cls,
+            "x": b["x"] + (b["x"] - a["x"]) * alpha,
+            "y": b["y"] + (b["y"] - a["y"]) * alpha,
+            "w": max(1e-4, b["w"] + (b["w"] - a["w"]) * alpha),
+            "h": max(1e-4, b["h"] + (b["h"] - a["h"]) * alpha),
+        }
+
+    def update(self, det: dict, frame_idx: int, *, obs_centric: bool = False) -> None:
         dt = max(1, frame_idx - self.last_frame)
         meas = [det["x"] + det["w"] / 2, det["y"] + det["h"] / 2, det["w"], det["h"]]
+
+        # OCR: when recovering a lost track, re-seed velocity from last observation
+        # → new observation so a drifted filter does not keep pulling the ID away.
+        if obs_centric and self.lost and self.last_obs is not None:
+            lo = self.last_obs
+            lo_cx = lo["x"] + lo["w"] / 2
+            lo_cy = lo["y"] + lo["h"] / 2
+            obs_dt = max(1, frame_idx - self.last_obs_frame)
+            self.vel = [
+                (meas[0] - lo_cx) / obs_dt,
+                (meas[1] - lo_cy) / obs_dt,
+                (meas[2] - lo["w"]) / obs_dt,
+                (meas[3] - lo["h"]) / obs_dt,
+            ]
+            self.state = meas
+            self.prev_obs = dict(self.last_obs)
+            self.prev_obs_frame = self.last_obs_frame
+            self.last_obs = {
+                "x": det["x"], "y": det["y"], "w": det["w"], "h": det["h"], "class": det["class"]
+            }
+            self.last_obs_frame = frame_idx
+            self.last_frame = frame_idx
+            self.hits += 1
+            self.lost = False
+            return
+
         if self.hits == 1:
             # Second observation: initialise velocity from the two boxes directly.
             self.vel = [(meas[i] - self.state[i]) / dt for i in range(4)]
             self.state = meas
+            self.prev_obs = dict(self.last_obs)
+            self.prev_obs_frame = self.last_obs_frame
+            self.last_obs = {
+                "x": det["x"], "y": det["y"], "w": det["w"], "h": det["h"], "class": det["class"]
+            }
+            self.last_obs_frame = frame_idx
             self.last_frame = frame_idx
             self.hits += 1
             self.lost = False
@@ -113,6 +203,12 @@ class _Track:
             resid = meas[i] - pred
             self.state[i] = pred + self.ALPHA * resid
             self.vel[i] = self.vel[i] + self.BETA * resid / dt
+        self.prev_obs = dict(self.last_obs)
+        self.prev_obs_frame = self.last_obs_frame
+        self.last_obs = {
+            "x": det["x"], "y": det["y"], "w": det["w"], "h": det["h"], "class": det["class"]
+        }
+        self.last_obs_frame = frame_idx
         self.last_frame = frame_idx
         self.hits += 1
         self.lost = False
@@ -140,22 +236,45 @@ def _similarity(pred: dict, det: dict, min_iou: float) -> float:
     return 0.0
 
 
+def _oc_score(track: _Track, det: dict, frame_idx: int, min_iou: float) -> float:
+    """Best of predicted / last-observation / OCM-virtual IoU (plus BYTE distance)."""
+    pred = track.predict(frame_idx)
+    best = _similarity(pred, det, min_iou)
+    if track.last_obs is not None:
+        best = max(best, iou(track.last_obs, det))
+        best = max(best, _similarity(track.last_obs, det, min_iou))
+    virtual = track.obs_centric_virtual(frame_idx)
+    if virtual is not None:
+        best = max(best, iou(virtual, det))
+        best = max(best, _similarity(virtual, det, min_iou))
+    return best
+
+
 def _greedy_match(
     tracks: list[_Track],
     dets: list[dict],
     frame_idx: int,
     min_iou: float,
     allow_distance: bool = False,
+    *,
+    obs_centric: bool = False,
 ) -> tuple[list[tuple[_Track, dict]], list[_Track], list[dict]]:
-    """Global greedy assignment by descending IoU (class-aware)."""
+    """Global greedy assignment by descending score (class-aware)."""
     pairs: list[tuple[float, int, int]] = []
     preds = [t.predict(frame_idx) for t in tracks]
     for ti, (track, pred) in enumerate(zip(tracks, preds)):
         for di, det in enumerate(dets):
             if det["class"] != track.cls:
                 continue
-            score = _similarity(pred, det, min_iou) if allow_distance else iou(pred, det)
-            if score >= min_iou or (allow_distance and score > 0):
+            if obs_centric and track.lost:
+                score = _oc_score(track, det, frame_idx, min_iou)
+            elif allow_distance:
+                score = _similarity(pred, det, min_iou)
+            else:
+                score = iou(pred, det)
+            if score >= min_iou or (allow_distance and score > 0) or (
+                obs_centric and track.lost and score >= min_iou
+            ):
                 pairs.append((score, ti, di))
     pairs.sort(reverse=True)
     used_t: set[int] = set()
@@ -197,13 +316,23 @@ def _fill_gaps(frames: list[dict[str, Any]], max_gap: int) -> int:
 def assign_tracks(
     frames: list[dict[str, Any]],
     iou_thresh: float | None = None,
+    algorithm: str | None = None,
     **params: Any,
 ) -> dict[str, Any]:
     """Assign stable track IDs to per-frame detections (mutates ``frames``).
 
     Returns track list, class counts and tracker metrics. ``iou_thresh`` is kept
     for backwards compatibility and maps to ``match_iou``.
+
+    ``algorithm`` may be ``byte`` (default) or ``ocsort``. Callers may also pass
+    ``tracker=ocsort`` / ``params.algorithm`` via the HTTP layer.
     """
+    # Accept tracker= as an alias when callers spread a params dict.
+    if algorithm is None and "tracker" in params:
+        algorithm = params.pop("tracker")
+    algo = normalize_algorithm(algorithm)
+    obs_centric = algo == "ocsort"
+
     cfg = {**DEFAULTS, **{k: v for k, v in params.items() if k in DEFAULTS and v is not None}}
     if iou_thresh is not None:
         cfg["match_iou"] = float(iou_thresh)
@@ -215,6 +344,7 @@ def assign_tracks(
     lost: list[_Track] = []
     rescued_low = 0
     refound = 0
+    ocm_refound = 0
 
     for fi, frame in enumerate(frames):
         dets = nms(
@@ -231,21 +361,34 @@ def assign_tracks(
         # Stage 1: confident boxes vs every live track (active + lost).
         pool = active + lost
         m1, rest_tracks, rest_high = _greedy_match(
-            pool, high_dets, fi, float(cfg["match_iou"]), allow_distance=True
+            pool,
+            high_dets,
+            fi,
+            float(cfg["match_iou"]),
+            allow_distance=True,
+            obs_centric=obs_centric,
         )
         for track, det in m1:
-            if track.lost:
+            was_lost = track.lost
+            if was_lost:
                 refound += 1
-            track.update(det, fi)
+                if obs_centric:
+                    # Count when last-obs / virtual beat a pure predict miss.
+                    pred_only = _similarity(track.predict(fi), det, float(cfg["match_iou"]))
+                    if pred_only < float(cfg["match_iou"]) and _oc_score(
+                        track, det, fi, float(cfg["match_iou"])
+                    ) >= float(cfg["match_iou"]):
+                        ocm_refound += 1
+            track.update(det, fi, obs_centric=obs_centric)
             det["track_id"] = track.track_id
 
         # Stage 2: low-score boxes rescue still-active tracks (IoU only).
         rest_active = [t for t in rest_tracks if not t.lost]
         m2, _unmatched_active, rest_low = _greedy_match(
-            rest_active, low_dets, fi, float(cfg["rescue_iou"])
+            rest_active, low_dets, fi, float(cfg["rescue_iou"]), obs_centric=False
         )
         for track, det in m2:
-            track.update(det, fi)
+            track.update(det, fi, obs_centric=obs_centric)
             det["track_id"] = track.track_id
             rescued_low += 1
 
@@ -294,14 +437,23 @@ def assign_tracks(
             else:
                 row["frames"] += 1
     tracks = list(unique.values())
+    if algo == "ocsort":
+        algo_label = (
+            "OC-SORT observation-centric association (OC-SORT-inspired) "
+            "+ BYTE two-stage + gap fill"
+        )
+    else:
+        algo_label = "BYTE two-stage association (ByteTrack-style) + gap fill"
     return {
         "tracks": tracks,
         "class_counts": dict(counters),
         "unique_tracks": len(unique),
         "tracker": {
-            "algorithm": "BYTE two-stage association (ByteTrack-style) + gap fill",
+            "algorithm": algo_label,
+            "id": ALGORITHM_IDS[algo],
             "params": cfg,
             "refound_after_miss": refound,
+            "obs_centric_refound": ocm_refound,
             "rescued_low_score": rescued_low,
             "gap_filled_boxes": filled,
             "single_frame_tracks": sum(1 for t in tracks if t["frames"] <= 1),

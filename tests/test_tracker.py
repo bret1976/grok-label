@@ -82,3 +82,51 @@ def test_crossing_objects_keep_ids() -> None:
     first = {d["track_id"] for d in frames[0]["detections"]}
     last = {d["track_id"] for d in frames[-1]["detections"]}
     assert first == last and len(first) == 2
+
+
+def test_ocsort_recovers_when_prediction_drifts_past_last_obs() -> None:
+    """Object accelerates then stops behind an occluder and reappears near last obs.
+
+    Constant-velocity BYTE prediction walks away; OC-SORT re-links via the last
+    observation (OCR) / observation-centric virtual box (OCM).
+    """
+    frames_byte = [
+        {"detections": [_det("cardboard box", 0.10, 0.5)]},
+        {"detections": [_det("cardboard box", 0.18, 0.5)]},
+        {"detections": []},
+        {"detections": []},
+        {"detections": [_det("cardboard box", 0.19, 0.5)]},
+    ]
+    frames_oc = [
+        {"detections": [_det("cardboard box", 0.10, 0.5)]},
+        {"detections": [_det("cardboard box", 0.18, 0.5)]},
+        {"detections": []},
+        {"detections": []},
+        {"detections": [_det("cardboard box", 0.19, 0.5)]},
+    ]
+    byte = assign_tracks(frames_byte, algorithm="byte")
+    oc = assign_tracks(frames_oc, algorithm="ocsort")
+    # BYTE drifts: predicted box misses the near-last-obs reappearance → new ID.
+    assert byte["unique_tracks"] >= 2
+    # OC-SORT keeps a single ID through the occlusion gap.
+    assert oc["unique_tracks"] == 1
+    assert oc["tracker"]["id"] == "ocsort-v1"
+    assert oc["tracker"]["refound_after_miss"] >= 1
+    assert oc["tracker"]["obs_centric_refound"] >= 1
+    ids = {d["track_id"] for f in frames_oc for d in f["detections"] if d.get("track_id")}
+    assert ids == {"BOX T0001"}
+
+
+def test_byte_default_unchanged_and_ocsort_alias() -> None:
+    frames = [
+        {"detections": [_det("person", 0.2, 0.2, score=0.9)]},
+        {"detections": [_det("person", 0.22, 0.21, score=0.8)]},
+    ]
+    default = assign_tracks([{"detections": [dict(d) for d in f["detections"]]} for f in frames])
+    assert default["tracker"]["id"] == "byte-v1"
+    aliased = assign_tracks(
+        [{"detections": [dict(d) for d in f["detections"]]} for f in frames],
+        tracker="ocsort",
+    )
+    assert aliased["tracker"]["id"] == "ocsort-v1"
+    assert aliased["unique_tracks"] == 1
