@@ -20,6 +20,7 @@ from app.export import (
     to_yolo,
     to_zip_bytes,
 )
+from app.export_qa import EXPORT_QA_ID, qa_info, validate_frames
 from app.grok_vision import resolve_api_key
 from app.pipeline import JOBS, load_job, new_job, run_job, save_job
 from app.tracker import ALGORITHM_IDS, ALGORITHMS, DEFAULTS as TRACKER_DEFAULTS
@@ -66,6 +67,7 @@ async def health():
         "trackers": ["byte-v1", "ocsort-v1"],
         "tracker_ocsort": True,
         "export": "dataset-pack-v1",
+        "export_qa": EXPORT_QA_ID,
     }
 
 
@@ -293,8 +295,10 @@ async def export_info():
         "default_size": {"width": 960, "height": 540},
         "notes": (
             "COCO/YOLO include untracked detections; MOT skips track_id is None. "
-            "Interpolated gap-fill boxes are included. Default tracker is byte-v1; pass tracker=ocsort for observation-centric recovery (ocsort-v1)."
+            "Interpolated gap-fill boxes are included. Default tracker is byte-v1; pass tracker=ocsort for observation-centric recovery (ocsort-v1). "
+            "POST /api/export/qa validates boxes/classes/track gaps (export-qa-v1) without changing formats."
         ),
+        "export_qa": EXPORT_QA_ID,
         "endpoints": {
             "POST /api/export": (
                 "{frames:[{t,detections:[{class,x,y,w,h,score,track_id?}]}], "
@@ -304,6 +308,8 @@ async def export_info():
             "GET /api/jobs/{id}/export?format=coco|yolo|mot|zip": (
                 "download labels for a finished job (zip is the dataset pack)"
             ),
+            "GET|POST /api/export/qa": "annotation QA (export-qa-v1); see GET for schema",
+            "GET /api/jobs/{id}/export/qa": "QA labels on a finished job",
         },
         "inspired_by": [
             "https://github.com/amanharshx/YOLO-Ndjson-Zip (MIT, multi-format zip idea)",
@@ -348,6 +354,69 @@ async def export_job(
         height=height,
     )
     return _export_payload(frames, fmt=format, width=w, height=h, job_id=job_id)
+
+
+
+@app.get("/api/export/qa")
+async def export_qa_info():
+    return qa_info()
+
+
+@app.post("/api/export/qa")
+async def export_qa_adhoc(payload: dict = Body(...)):
+    """Validate ad-hoc labeled frames (optionally after tracking). Backend only."""
+    frames = _clean_frames(payload.get("frames"))
+    # _clean_frames strips track_id/source; re-attach from raw when provided.
+    raw_frames = payload.get("frames") or []
+    for i, frame in enumerate(frames):
+        raw_dets = (raw_frames[i] or {}).get("detections") or []
+        for j, det in enumerate(frame["detections"]):
+            if j >= len(raw_dets):
+                continue
+            tid = raw_dets[j].get("track_id")
+            if tid is not None and str(tid).strip() != "":
+                det["track_id"] = tid
+            src = raw_dets[j].get("source")
+            if src:
+                det["source"] = src
+    has_any_tid = any(
+        d.get("track_id") is not None
+        for f in frames
+        for d in (f.get("detections") or [])
+    )
+    if bool(payload.get("track", False)) or not has_any_tid:
+        params = _clean_params(payload.get("params"))
+        assign_tracks(
+            frames,
+            algorithm=_resolve_algorithm(payload, payload.get("params") or {}),
+            **params,
+        )
+    max_gap = payload.get("max_track_gap")
+    try:
+        max_track_gap = int(max_gap) if max_gap is not None else 8
+    except (TypeError, ValueError):
+        raise HTTPException(400, "max_track_gap must be an integer")
+    max_track_gap = max(0, min(max_track_gap, 60))
+    report = validate_frames(frames, max_track_gap=max_track_gap)
+    report["frames_validated"] = len(frames)
+    return report
+
+
+@app.get("/api/jobs/{job_id}/export/qa")
+async def export_qa_job(
+    job_id: str,
+    max_track_gap: int = Query(8),
+):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("status") != "done" or not job.get("frames"):
+        raise HTTPException(409, "job is not finished yet")
+    gap = max(0, min(int(max_track_gap), 60))
+    report = validate_frames(job["frames"], max_track_gap=gap)
+    report["job_id"] = job_id
+    report["frames_validated"] = len(job["frames"])
+    return report
 
 
 @app.get("/api/tracker")
