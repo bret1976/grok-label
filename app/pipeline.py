@@ -24,7 +24,8 @@ def job_dir(job_id: str) -> Path:
 
 
 def load_job(job_id: str) -> dict[str, Any] | None:
-    path = job_dir(job_id) / "job.json"
+    # Read-only lookup: don't create an empty folder for every unknown id (job-guard-v1).
+    path = JOBS / job_id / "job.json"
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
@@ -117,6 +118,26 @@ async def run_job(job_id: str) -> None:
         "done",
     )
     save_job(job)
+
+
+async def run_job_safe(job_id: str) -> None:
+    """run_job, but a crash marks the job ``error`` instead of leaving it "running" (job-guard-v1)."""
+    try:
+        await run_job(job_id)
+    except Exception as exc:  # noqa: BLE001 - surface any pipeline failure to the job
+        job = load_job(job_id)
+        if not job:
+            return
+        job["status"] = "error"
+        job["error"] = str(exc)[:400]
+        safe = str(exc)[:300].replace("<", " ").replace(">", " ")
+        log(job, f"Labeling stopped: {safe}", "error")
+        try:
+            from app.job_guard import bump
+
+            bump("crashed_marked_error")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def new_job(video_path: Path, *, sample_fps: float, grid: int, model: str) -> dict[str, Any]:

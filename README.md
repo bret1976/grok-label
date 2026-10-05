@@ -108,3 +108,31 @@ Inspired by [amanharshx/YOLO-Ndjson-Zip](https://github.com/amanharshx/YOLO-Ndjs
 (MIT, multi-format zip idea) plus the public COCO instances, YOLO/Ultralytics txt,
 and MOT Challenge specs. Original code — nothing vendored. Do not copy GPL tooling
 (e.g. X-AnyLabeling).
+
+## Job guard (job-guard-v1)
+
+Each upload fans out into `frames × (1 + grid²)` Grok vision calls (≈405 for a 20s
+clip at 4 fps with the 2×2 tile pass), and `POST /api/jobs` is public. Before a job is
+queued the backend now:
+
+- streams the upload and stops at `MAX_UPLOAD_MB` (default 300) → 413;
+- probes it with ffprobe and rejects files with no real video stream or no usable
+  duration → 400 (validated by probing, not by extension);
+- rejects clips longer than `MAX_CLIP_SECONDS` (default 180) → 400;
+- reuses a finished job when the exact same bytes were already labeled with the same
+  `SAMPLE_FPS`, `TILE_GRID`, and `GROK_MODEL` (SHA-256 content address) — response
+  carries `reused: true`, no new Grok spend;
+- allows at most `MAX_ACTIVE_JOBS` (default 2) queued/running jobs → 429
+  (jobs untouched for `JOB_STALE_MINUTES`, default 30, don't count);
+- marks a crashed job `error` instead of leaving it "running" forever.
+
+`JOB_GUARD=0` turns the checks off (crash capture stays on).
+
+| Route | Use |
+| --- | --- |
+| `GET /api/job-guard/summary` | enabled, limits, active jobs, per-process counters |
+
+Ideas from SHA-256 upload dedupe before enqueue (e.g. InfantLab/VideoAnnotator job
+API), Rendobar's "validate uploads with ffprobe, not extensions", Cloudflare Stream
+`maxDurationSeconds`, and pre-call LLM budget guards (Amitcoh1/agentbreaker,
+r/ArtificialInteligence). Original code — nothing vendored.

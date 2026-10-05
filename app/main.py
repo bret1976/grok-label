@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,7 +23,8 @@ from app.export import (
 )
 from app.export_qa import EXPORT_QA_ID, qa_info, validate_frames
 from app.grok_vision import resolve_api_key
-from app.pipeline import JOBS, load_job, new_job, run_job, save_job
+from app.job_guard import JOB_GUARD_ID, GuardReject, bump as guard_bump, check_upload, enabled as guard_enabled, max_upload_bytes, summary as guard_summary
+from app.pipeline import JOBS, load_job, new_job, run_job_safe, save_job
 from app.tracker import ALGORITHM_IDS, ALGORITHMS, DEFAULTS as TRACKER_DEFAULTS
 from app.tracker import assign_tracks, interpolate_box, normalize_algorithm, stats
 
@@ -68,30 +70,90 @@ async def health():
         "tracker_ocsort": True,
         "export": "dataset-pack-v1",
         "export_qa": EXPORT_QA_ID,
+        "job_guard": JOB_GUARD_ID,
     }
 
 
-def _start(background: BackgroundTasks, video: Path):
-    job = new_job(
-        video,
-        sample_fps=float(os.environ.get("SAMPLE_FPS") or 4),
-        grid=int(os.environ.get("TILE_GRID") or 2),
-        model=os.environ.get("GROK_MODEL") or "grok-4.20-0309-non-reasoning",
-    )
-    background.add_task(run_job, job["id"])
+def _job_settings() -> dict[str, Any]:
+    return {
+        "sample_fps": float(os.environ.get("SAMPLE_FPS") or 4),
+        "grid": int(os.environ.get("TILE_GRID") or 2),
+        "model": os.environ.get("GROK_MODEL") or "grok-4.20-0309-non-reasoning",
+    }
+
+
+def _start(background: BackgroundTasks, video: Path, guard: dict | None = None):
+    job = new_job(video, **_job_settings())
+    if guard:
+        job["fingerprint"] = guard.get("fingerprint")
+        job["guard"] = {
+            "id": JOB_GUARD_ID,
+            "probe": guard.get("probe"),
+            "estimated_grok_calls": guard.get("estimated_grok_calls"),
+        }
+        save_job(job)
+    background.add_task(run_job_safe, job["id"])
     return {"ok": True, "job_id": job["id"], "job": public_job(job)}
+
+
+async def _save_upload(file: UploadFile, dest: Path) -> int:
+    """Stream the upload to disk; enforce MAX_UPLOAD_MB while reading (job-guard-v1)."""
+    limit = max_upload_bytes() if guard_enabled() else None
+    total = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    too_large = False
+    with dest.open("wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if limit is not None and total > limit:
+                too_large = True
+                break
+            fh.write(chunk)
+    if too_large:
+        dest.unlink(missing_ok=True)
+        guard_bump("blocked_too_large")
+        raise HTTPException(
+            413,
+            f"Clip is larger than {limit // (1024 * 1024)} MB. Trim or compress it and try again.",
+        )
+    return total
 
 
 @app.post("/api/jobs")
 async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
-    suffix = Path(file.filename or "clip.mp4").suffix or ".mp4"
-    tmp = JOBS / f"upload-{Path(file.filename or 'clip').stem}{suffix}"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_bytes(await file.read())
-    return _start(background, tmp)
+    suffix = (Path(file.filename or "clip.mp4").suffix or ".mp4")[:8]
+    tmp = JOBS / f"upload-{uuid.uuid4().hex[:12]}{suffix}"
+    await _save_upload(file, tmp)
+    try:
+        guard = None
+        if guard_enabled():
+            try:
+                guard = check_upload(tmp, jobs_root=JOBS, **_job_settings())
+            except GuardReject as exc:
+                raise HTTPException(exc.status, exc.detail)
+            reuse = guard.get("reuse_job")
+            if reuse:
+                return {
+                    "ok": True,
+                    "job_id": reuse["id"],
+                    "job": public_job(reuse),
+                    "reused": True,
+                    "estimated_grok_calls_saved": guard.get("estimated_grok_calls"),
+                }
+        out = _start(background, tmp, guard)
+        if guard:
+            guard_bump("accepted")
+        return out
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-
+@app.get("/api/job-guard/summary")
+async def job_guard_summary():
+    return guard_summary(JOBS)
 
 
 def public_job(job: dict) -> dict:
