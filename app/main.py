@@ -24,6 +24,7 @@ from app.export import (
 from app.export_qa import EXPORT_QA_ID, qa_info, validate_frames
 from app.grok_vision import resolve_api_key
 from app.job_guard import JOB_GUARD_ID, GuardReject, bump as guard_bump, check_upload, enabled as guard_enabled, max_upload_bytes, summary as guard_summary
+from app.stale_job_watch import STALE_JOB_WATCH_ID, enabled as stale_watch_enabled, summary as stale_watch_summary, sweep as stale_job_sweep
 from app.pipeline import JOBS, load_job, new_job, run_job_safe, save_job
 from app.tracker import ALGORITHM_IDS, ALGORITHMS, DEFAULTS as TRACKER_DEFAULTS
 from app.tracker import assign_tracks, interpolate_box, normalize_algorithm, stats
@@ -45,6 +46,8 @@ RESEARCH = ROOT / "research"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     JOBS.mkdir(parents=True, exist_ok=True)
+    # stale-job-watch-v1: close jobs left queued/running by a prior crash/deploy.
+    stale_job_sweep(JOBS)
     yield
 
 
@@ -71,6 +74,8 @@ async def health():
         "export": "dataset-pack-v1",
         "export_qa": EXPORT_QA_ID,
         "job_guard": JOB_GUARD_ID,
+        "stale_job_watch": STALE_JOB_WATCH_ID,
+        "stale_job_watch_enabled": stale_watch_enabled(),
     }
 
 
@@ -128,6 +133,8 @@ async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
     tmp = JOBS / f"upload-{uuid.uuid4().hex[:12]}{suffix}"
     await _save_upload(file, tmp)
     try:
+        # stale-job-watch-v1: free active slots held by dead BackgroundTasks.
+        stale_job_sweep(JOBS)
         guard = None
         if guard_enabled():
             try:
@@ -154,6 +161,11 @@ async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
 @app.get("/api/job-guard/summary")
 async def job_guard_summary():
     return guard_summary(JOBS)
+
+
+@app.get("/api/stale-job-watch/summary")
+async def stale_job_watch_summary():
+    return stale_watch_summary(JOBS)
 
 
 def public_job(job: dict) -> dict:

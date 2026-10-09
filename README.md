@@ -56,6 +56,9 @@ Env:
 | `SAMPLE_FPS` | frames sent to Grok (default 4 → ~81 frames on a 20s clip) |
 | `TILE_GRID` | 1 = full frame only; 2 = 2×2 extra tiles |
 | `MAX_CONCURRENCY` | parallel Grok calls |
+| `JOB_GUARD` | `0` disables upload size/probe/reuse/busy checks (crash capture stays on) |
+| `STALE_JOB_WATCH` | `0` disables stale queued/running reaper (stale-job-watch-v1) |
+| `STALE_JOB_WATCH_MINUTES` | minutes before a queued/running job is marked `error`/`stale_timeout` (default 30) |
 
 Screenshots from the original post live in `research/`.
 
