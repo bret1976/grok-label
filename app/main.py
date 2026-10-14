@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any
 
-from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -23,7 +23,8 @@ from app.export import (
 )
 from app.export_qa import EXPORT_QA_ID, qa_info, validate_frames
 from app.grok_vision import resolve_api_key
-from app.job_guard import JOB_GUARD_ID, GuardReject, bump as guard_bump, check_upload, enabled as guard_enabled, max_upload_bytes, summary as guard_summary
+from app.job_guard import JOB_GUARD_ID, GuardReject, bump as guard_bump, check_upload, enabled as guard_enabled, estimate_calls, limits as guard_limits, max_upload_bytes, summary as guard_summary
+from app import grok_call_budget
 from app.stale_job_watch import STALE_JOB_WATCH_ID, enabled as stale_watch_enabled, summary as stale_watch_summary, sweep as stale_job_sweep
 from app.pipeline import JOBS, load_job, new_job, run_job_safe, save_job
 from app.tracker import ALGORITHM_IDS, ALGORITHMS, DEFAULTS as TRACKER_DEFAULTS
@@ -46,6 +47,7 @@ RESEARCH = ROOT / "research"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     JOBS.mkdir(parents=True, exist_ok=True)
+    grok_call_budget.configure(JOBS)
     # stale-job-watch-v1: close jobs left queued/running by a prior crash/deploy.
     stale_job_sweep(JOBS)
     yield
@@ -76,6 +78,8 @@ async def health():
         "job_guard": JOB_GUARD_ID,
         "stale_job_watch": STALE_JOB_WATCH_ID,
         "stale_job_watch_enabled": stale_watch_enabled(),
+        "grok_call_budget": grok_call_budget.GROK_CALL_BUDGET_ID,
+        "grok_call_budget_enabled": grok_call_budget.enabled(),
     }
 
 
@@ -87,8 +91,12 @@ def _job_settings() -> dict[str, Any]:
     }
 
 
-def _start(background: BackgroundTasks, video: Path, guard: dict | None = None):
+def _start(background: BackgroundTasks, video: Path, guard: dict | None = None, budget: dict | None = None):
     job = new_job(video, **_job_settings())
+    if budget and budget.get("reserved"):
+        job["budget"] = {"id": grok_call_budget.GROK_CALL_BUDGET_ID, "reserved_calls": budget["reserved"], "day_utc": budget.get("day")}
+        grok_call_budget.attach_job(job["id"], budget)
+        save_job(job)
     if guard:
         job["fingerprint"] = guard.get("fingerprint")
         job["guard"] = {
@@ -127,8 +135,22 @@ async def _save_upload(file: UploadFile, dest: Path) -> int:
     return total
 
 
+def _reserve_budget(request: Request, guard: dict | None) -> dict:
+    """grok-call-budget-v1 pre-flight: hold this job's estimated Grok calls or 429."""
+    grok_call_budget.configure(JOBS)
+    settings = _job_settings()
+    est = (guard or {}).get("estimated_grok_calls")
+    fallback = estimate_calls(guard_limits()["max_clip_seconds"], settings["sample_fps"], settings["grid"])
+    try:
+        return grok_call_budget.reserve(
+            grok_call_budget.client_key_from_request(request), est, fallback_calls=fallback
+        )
+    except grok_call_budget.BudgetReject as exc:
+        raise HTTPException(exc.status, exc.detail, headers={"Retry-After": str(exc.retry_after)})
+
+
 @app.post("/api/jobs")
-async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
+async def create_job(request: Request, background: BackgroundTasks, file: UploadFile = File(...)):
     suffix = (Path(file.filename or "clip.mp4").suffix or ".mp4")[:8]
     tmp = JOBS / f"upload-{uuid.uuid4().hex[:12]}{suffix}"
     await _save_upload(file, tmp)
@@ -150,7 +172,12 @@ async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
                     "reused": True,
                     "estimated_grok_calls_saved": guard.get("estimated_grok_calls"),
                 }
-        out = _start(background, tmp, guard)
+        budget = _reserve_budget(request, guard)
+        try:
+            out = _start(background, tmp, guard, budget)
+        except Exception:
+            grok_call_budget.release(budget)
+            raise
         if guard:
             guard_bump("accepted")
         return out
@@ -161,6 +188,12 @@ async def create_job(background: BackgroundTasks, file: UploadFile = File(...)):
 @app.get("/api/job-guard/summary")
 async def job_guard_summary():
     return guard_summary(JOBS)
+
+
+@app.get("/api/grok-call-budget/summary")
+async def grok_call_budget_summary(request: Request):
+    grok_call_budget.configure(JOBS)
+    return grok_call_budget.summary(client=grok_call_budget.client_key_from_request(request))
 
 
 @app.get("/api/stale-job-watch/summary")

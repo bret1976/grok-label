@@ -59,6 +59,11 @@ Env:
 | `JOB_GUARD` | `0` disables upload size/probe/reuse/busy checks (crash capture stays on) |
 | `STALE_JOB_WATCH` | `0` disables stale queued/running reaper (stale-job-watch-v1) |
 | `STALE_JOB_WATCH_MINUTES` | minutes before a queued/running job is marked `error`/`stale_timeout` (default 30) |
+| `GROK_CALL_BUDGET` | `0` disables the daily Grok call budget (grok-call-budget-v1); summary at `GET /api/grok-call-budget/summary` |
+| `GROK_DAILY_CALL_BUDGET` | global Grok vision calls per UTC day, reserved per job before it starts (default 8000) |
+| `GROK_CLIENT_DAILY_CALLS` | per-client Grok calls per UTC day (default 4000 ≈ one 180 s clip) |
+| `GROK_CLIENT_JOBS_PER_HOUR` | per-client new labeling jobs per rolling hour (default 6) |
+| `GROK_CALL_HARD_PCT` | runtime backstop: stop calls once actual calls reach this % of the daily budget (default 110) |
 
 Screenshots from the original post live in `research/`.
 

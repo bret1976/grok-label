@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from app.grok_call_budget import meter_call
 from app.tracker import CLASSES
 
 PROMPT = """You are labeling a warehouse CCTV still for a computer-vision dataset.
@@ -128,6 +129,8 @@ async def label_image(path: Path, *, model: str, tile_note: str = "full frame") 
             }
         ],
     }
+    # grok-call-budget-v1: count every paid call; stop at today's hard ceiling.
+    meter_call()
     async with _client() as client:
         response = await client.post("/chat/completions", json=body)
     if response.status_code >= 400:

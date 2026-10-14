@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.frames import extract_frames
+from app import grok_call_budget
 from app.grok_vision import label_frame
 from app.tracker import assign_tracks, nms, stats
 
@@ -46,6 +47,8 @@ async def run_job(job_id: str) -> None:
     job = load_job(job_id)
     if not job:
         return
+    # grok-call-budget-v1: attribute this run's Grok calls to the job (for refunds).
+    grok_call_budget.CURRENT_JOB.set(job_id)
     job["status"] = "running"
     job["stage"] = "generate"
     log(job, "Grok accepted the request. Extracting CCTV frames.", "tool")
@@ -136,6 +139,12 @@ async def run_job_safe(job_id: str) -> None:
             from app.job_guard import bump
 
             bump("crashed_marked_error")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        # grok-call-budget-v1: refund the unused part of this job's reservation.
+        try:
+            grok_call_budget.settle(job_id)
         except Exception:  # noqa: BLE001
             pass
 
